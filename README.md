@@ -1,6 +1,6 @@
 # Hubitat
 
-# Nedis 4 button FOB
+<b>Nedis 4 button FOB</b>
 
 Driver originally created by diondp (https://community.hubitat.com/t/release-nedis-zigbee-4-button-fob-remote-zbrc10wt/67195)
 
