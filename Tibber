@@ -47,6 +47,8 @@ metadata {
 	    attribute "currentLevel", "String"
 	    attribute "currentTile", "String"
 	    attribute "CurrentPrice", "NUMBER"
+	attribute "expensiveHours", "String"
+	attribute "cheapHours", "String"
 	    
 	   
 	    command "forceCheap", [[name:"Force new calculation of cheapest period"]]
