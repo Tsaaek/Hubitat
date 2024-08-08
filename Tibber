@@ -1,0 +1,517 @@
+/*
+
+
+Tibber Electricity price api
+
+Based on Kari Kauppinens driver https://github.com/kapakauppinen/hubitat/tree/main/Drivers/ElectricityAPI
+
+Child switch devices turns on as follow:
+
+	- belowAvg = current price is below the day average
+	- aboveAvg = current price is above the day average
+	- expensiveHour = the hour is within the top x most expensive hours of the day (x is set in perferences)
+	- cheapHour = the hour is within the top X most cheap hours of the day
+	- cheapPeriod = The period of choosen length with the average lowest price. For use with for example water heaters or other devices that needs a longer operating time.
+		Period is calculated every day at 15.00 when the prices of the following day is avaible. It is possible force calculation with "Force cheap" command.
+		It is also possible to manually set a period with "Set cheap Period" command. Input start hour (e.g 2) and perfered length of period.
+
+
+Attributes:
+	- httpError = If there are any errors when fething prices from Tibber this attribute is set to the error thrown. You can monitor this attribute in a rule to send a notification to know if there are problems with the api.
+	- cheapestPeriod = Calculated timeperiod for child-device cheapPeriod
+	
+
+ */
+import java.text.SimpleDateFormat
+import groovy.json.JsonOutput
+import groovy.json.JsonBuilder
+import groovy.time.TimeCategory
+
+
+metadata {
+    definition(name: "Tibber", namespace: "tsaaek", author: "Tommy Saaek", importUrl: "") {
+        capability "Sensor"
+        capability "Initialize"
+	    capability "Polling"
+	    capability "Refresh"
+	    capability "Actuator"
+	
+	    attribute "today", "HashMap"
+	    attribute "tomorrow", "HashMap"
+	    attribute "upcomming24hours", "HashMap"
+	    attribute "averageToday", "Number"
+	    attribute "averageTomorrow", "Number"
+	    attribute "averageUpcomingHours", "Number"
+	    attribute "cheapestPeriod", "String"
+	    attribute "httpError", "String"
+	    attribute "currentLevel", "String"
+	    attribute "currentTile", "String"
+	    attribute "CurrentPrice", "NUMBER"
+	    
+	   
+	    command "forceCheap", [[name:"Force new calculation of cheapest period"]]
+	    command "setCheapPeriod", [
+		    [name:"Start time", type:"NUMBER", description:"Time at which the cheap period starts (Only hour, e.g 2)"],
+		    [name:"Duration", type:"NUMBER", description:"Duration of the cheap period (hours)"]
+				       ]
+
+
+	    
+    }
+}
+
+preferences {
+    section("Security") {
+        input "securityToken", "text", title: "Tibber API-token", required: true
+
+	input name: "logEnable", type: "bool", title: "Enable debug logging", defaultValue: true
+	    
+	input name: "tax", type: "bool", title: "Show prices including tax", defaultValue: true
+	    
+
+	
+	input name: "grid", type: "bool", title: "Include grid transfer fees", defaultValue: false
+	input name: "gridTransfer", type: "decimal", title: "Transfer fee/kWh (inc taxes)", defaultValue:0
+	input name: "gridTransferFactor", type:"decimal", title: "Transfer fee factor %. Ex from Kraftringen: Transfer fee = *transfer fee* + factor x spot price (inc tax)", defaultValue:0
+	
+	input name: "electricTax", type:"decimal", title: "Additional taxes charged by grid operator (per kWh)", defaultValue:0
+	    
+	
+	
+	    
+	input "topLen", "number", title:"Top X cheap & expensive hours"
+	    
+	    
+	
+	 
+	    
+	input "periodLen", "number", title:"Length of cheap period (hours)"
+	    
+    }
+
+}
+
+def clearStateVariables(){
+    device.deleteCurrentState('PriceListToday')
+    state.clear()
+}
+
+def logsOff() {
+    log.warn "debug logging disabled..."
+    device.updateSetting("logEnable", [value: "false", type: "bool"])
+}
+
+def updated() {
+
+}
+
+def logInfo(msg){
+	if (logEnable) log.info msg	
+}
+
+def poll () {
+
+    //refresh()
+	def hour = new Date().getHours()
+	
+
+	
+	HashMap<String, String> today = new HashMap<String, String>()
+	
+
+    //remove {}
+    def todayString =device.currentValue("today").substring(1, device.currentValue("today").length() - 1)
+
+
+    //string to hasmap
+    for(String keyValue : todayString.split(",")) {
+
+        String[] pairs = keyValue.split("=", 2)
+        today.put(pairs[0].trim(), pairs.length == 1 ? "" : pairs[1].trim());
+    }
+
+sendEvent(name: "CurrentPrice", value: today."${hour}")
+
+}
+def installed() {
+    log.info "installed() called"
+	sendEvent(name: "PriceListToday", value: "{}")
+    	updated()
+}
+
+def initialize() {
+	try {
+	    addChildDevice("hubitat", "Virtual Switch", "${device.id}-expensiveHour", [name : "expensiveHour"])
+	    addChildDevice("hubitat", "Virtual Switch", "${device.id}-cheapHour", [name : "cheapHour"])
+	    addChildDevice("hubitat", "Virtual Switch", "${device.id}-aboveAvg", [name : "aboveAvg"])
+	    addChildDevice("hubitat", "Virtual Switch", "${device.id}-belowAvg", [name : "belowAvg"])
+	    addChildDevice("hubitat", "Virtual Switch", "${device.id}-cheapPeriod", [name : "cheapPeriod"])
+	}
+	            catch (Exception ex) {
+                  // Child devices are already created
+            }
+	log.info "initialize() called"
+	
+}
+
+def refresha(responseBody, data) {
+	
+
+	   sendEvent(name: "httpError", value: 0)
+   
+	
+	
+	
+	childs = getChildDevices()
+	
+	def slurper = new groovy.json.JsonSlurper()
+ 	def result = slurper.parseText(responseBody.data)
+	
+	
+	def todayJson = new JsonBuilder()
+	def today = [:]
+	def cheapHours = [:]
+	def expensiveHours = [:]
+	def tomorrow = [:]
+	def upcoming = [:]
+	def hour = new Date().getHours()
+	def avgToday = 0.00
+	def avgTomorrow = 0
+    	
+
+        //get the Timeseries from the Data
+	def day = 1
+
+	try {
+		def todayOut = 'Today<table style="width:100%">'
+	for(def i = 0; i<24; i++){
+
+		  def label = i
+		def val = 0
+		def gridFee = 0
+		
+		if(grid){
+			
+			gridFee = gridTransfer + (gridTransferFactor / 100) * (result.data.viewer.homes[0].currentSubscription.priceInfo.today[i].total * 100) + electricTax
+			
+			
+		}
+		if(tax){	
+		val = result.data.viewer.homes[0].currentSubscription.priceInfo.today[i].total + (gridFee / 100)
+		} else {	
+		val = result.data.viewer.homes[0].currentSubscription.priceInfo.today[i].energy	+ (gridFee / 100)
+		}
+			def tagPos = ""
+			
+		if(i == hour){
+			tagPos = "<b><u>"
+			
+		}
+
+			todayOut += "<tr><td>" + tagPos+ "" + makeHourString(i) + "</td><td>"+ tagPos +"" + Math.round(val * 100)+ "</td></tr>"
+			today.put(label, val);
+			
+                }
+		todayOut += "</table>"
+		sendEvent(name: "today", value: todayOut)
+		
+	}
+            
+            catch (Exception ex) {
+                  log.debug "today " + ex
+            }
+		
+// Tomorrows prices
+		
+	def tomorrowOut = 'Tomorrow<table style="width:100%">'
+            try {
+		    
+		    
+		    for(def i = 0; i<24; i++){
+			
+
+			 def label = i
+		
+			    def val = 0
+			    		if(grid){
+			
+			gridFee = gridTransfer + (gridTransferFactor / 100) * (result.data.viewer.homes[0].currentSubscription.priceInfo.tomorrow[i].total * 100) + electricTax
+
+		}
+					if(tax){
+		val = result.data.viewer.homes[0].currentSubscription.priceInfo.tomorrow[i].total + (gridFee / 100)
+		} else {
+		val = result.data.viewer.homes[0].currentSubscription.priceInfo.tomorrow[i].energy + (gridFee / 100)	
+		}
+			
+                tomorrowOut += "<tr><td>" + makeHourString(i) + "</td><td>" + Math.round(val * 100)+ "</td></tr>"  
+                   
+			tomorrow.put(label, val);
+                }
+		tomorrowOut += "</table>"    
+	    }
+
+
+            
+            catch (Exception ex) {
+                  tomorrowOut += "</table>not available yet" 
+            }
+		sendEvent(name: "tomorrow", value: tomorrowOut)
+	
+
+		
+        today = today.sort { it.key }
+	tomorrow = tomorrow.sort { it.key }
+		
+		
+
+
+		today.each {
+			avgToday += it.value
+			
+		}
+		avgToday = Math.round((avgToday / 24)*100)//.round(2)
+		try {
+		
+		tomorrow.each {
+			avgTomorrow += it.value
+			
+		}
+		avgTomorrow = Math.round((avgTomorrow / 24)*100)//.round(2)
+		sendEvent(name: "averageTomorrow", value: avgTomorrow)
+		}
+		catch(Exception e){
+		}
+		
+	sendEvent(name: "averageToday", value: avgToday)
+	
+
+	
+		def ahead24hours = [:]
+
+	
+	if(hour < 14){ 
+		for(int i = 0; i < 24; i++){
+			
+		ahead24hours.put("${today.keySet().toArray()[i]}" , today[i])
+		}
+	}
+	else {
+		d = 0
+		h = hour
+
+		for(int i = 0; i < 24; i++){
+			if(h < 24 && h > 15 && d == 0) {
+				
+				ahead24hours.put("${today.keySet().toArray()[h]}" , today[h])
+				
+				h++
+					if(h == 24){
+						h=0
+						d=1
+					}
+			
+
+			}
+			else {
+				ahead24hours.put("${tomorrow.keySet().toArray()[h]}" , tomorrow[h])
+
+				h++
+			}
+		}
+	}
+	sendEvent(name: "upcomming24hours", value: ahead24hours)
+	
+	def aheadSortedByPrice = ahead24hours.sort {it.value}
+	
+//Get cheapest period. Only do this once a day at 1500 when tomorrows prices are added to the upcomming hours.
+	
+
+	if(hour == 15 || state.getCheap == true){
+	def cheapestPeriods = [:]
+	
+	for(int i = 0; i < 23; i++){
+
+		def sum = 0
+		def a = i
+		
+		for(int x = 1; x <= periodLen; x++){
+			
+			
+		sum += ahead24hours.find{ it.key == "${a}" }?.value
+
+			a++
+				if(a == 24){
+					a = 0
+				}
+			}
+
+		sum = (sum / periodLen)//.round(2)
+		
+		cheapestPeriods.put("${i}" , sum)
+}
+		cheapestPeriods = cheapestPeriods.sort {it.value}
+		state.cheapestPeriodStart = cheapestPeriods.keySet().toArray()[0].toInteger()
+		cheapestPeriodEnd = state.cheapestPeriodStart  + periodLen
+		if(cheapestPeriodEnd >= 24){
+		cheapestPeriodEnd -= 24
+		}
+		state.cheapestPeriodEnd = cheapestPeriodEnd
+		sendEvent(name: "cheapestPeriod", value: makeHourString(state.cheapestPeriodStart) +" - " + makeHourString(cheapestPeriodEnd))
+		state.periodLength = periodLen
+		logInfo("Cheapest period is calculated to " + makeHourString(state.cheapestPeriodStart) +" - " + makeHourString(cheapestPeriodEnd))
+		state.getCheap = false
+	}
+	
+
+		
+	
+//Get hours above and below day average. Hours below 
+	def aboveAvg = [:]
+	def belowAvg = [:]
+	
+	today.each{
+		if(it.value.toInteger() < avgToday){
+			belowAvg.put("${it.key}" , it.value)
+		}
+		if(it.value.toInteger() > avgToday){
+			aboveAvg.put("${it.key}" , it.value)
+		}
+	}
+	sendEvent(name: "hoursBelowAvg", value: belowAvg)
+	sendEvent(name: "hoursAboveAvg", value: aboveAvg) 
+	
+//Get top X cheap and expensive hours
+	todaySortedByPrice = today.sort {it.value}
+	def q = 1
+	todaySortedByPrice.each {
+		if(q <= topLen){
+			cheapHours.put("${it.key}", it.value)
+		}
+		if(q >= (23 - topLen)){
+			expensiveHours.put("${it.key}", it.value)
+		}
+		q++
+			}
+	sendEvent(name: "expensiveHours", value: expensiveHours)
+	sendEvent(name: "cheapHours", value: cheapHours)
+	
+		if(expensiveHours.containsKey("${hour}")){
+			childs[0].on()
+		} else {
+			childs[0].off()	
+		}
+		if(cheapHours.containsKey("${hour}")){
+			childs[1].on()
+		} else {
+			childs[1].off()
+		}
+		if(aboveAvg.containsKey("${hour}")){
+			childs[2].on()
+		} else {
+			childs[2].off()
+		}
+		if(belowAvg.containsKey("${hour}")){
+			childs[3].on()
+		} else {
+			childs[3].off()
+		}
+	
+
+	def val = 0
+		if(tax){	
+			val = result.data.viewer.homes[0].currentSubscription.priceInfo.current.total	
+		} else {	
+			val = result.data.viewer.homes[0].currentSubscription.priceInfo.current.energy	
+		}
+	def currentTile = "Current price<h1>" + Math.round(val * 100) + "</h1>" + result.data.viewer.homes[0].currentSubscription.priceInfo.current.level + ""
+	sendEvent(name: "CurrentPrice", value: Math.round(val * 100))
+	sendEvent(name: "currentLevel", value: result.data.viewer.homes[0].currentSubscription.priceInfo.current.level)
+	sendEvent(name: "currentTile", value: currentTile)
+
+	if(hour == state.cheapestPeriodStart){
+		childs[4].on()
+		logInfo("Cheap period started")
+		
+		
+		
+		runIn((state.periodLength * 3600), cheapPeriodEnd)
+	}
+
+}
+
+def cheapPeriodEnd(){
+	childs = getChildDevices()
+	childs[4].off()
+	logInfo("Cheap period ended")
+	
+}
+
+def refresh(){
+	
+	    def postParams = [
+            uri: "https://api.tibber.com/v1-beta/gql",
+	    contentType: "application/json",
+	    requestContentType: "application/json",
+            headers: [ "Authorization": "Bearer $securityToken"],
+            body: graphQLApiQuery()
+        ]
+        
+        
+        asynchttpPost('refresha', postParams)
+
+}
+
+def graphQLApiQuery(){
+    return '{"query": "{viewer {homes {currentSubscription {priceInfo { current {total currency level energy} today{ total energy level} tomorrow{ total energy level}}}}}}", "variables": null, "operationName": null}';
+}
+
+
+
+def forceCheap(){
+	state.getCheap = true
+	logInfo("Force Cheap command called")
+	refresh()
+}
+
+def setCheapPeriod(start, len){
+
+	def dat = new Date()
+	try{
+		def startTime = start.toInteger()
+		
+		if(dat.getHours() <= startTime){
+			dat.setDate(dat.getDate() + 1)
+		}
+		
+		dat.setHours(startTime + len.toInteger())
+		
+		def endTime = dat.getHours()
+		
+		state.cheapestPeriodStart = start.toInteger()
+		state.periodLength = len.toInteger()
+		logInfo("Cheapest period was manually set to " + makeHourString(startTime) + "-" + makeHourString(endTime))
+		sendEvent(name: "cheapestPeriod", value : makeHourString(startTime) + "-" + makeHourString(endTime))		
+	}
+	catch(e){
+		log.debug e
+	}
+
+
+	
+}
+
+def makeHourString(h){
+	
+	def out = ""
+	
+	if(h < 10){
+		out += "0"+h+":00"
+	}
+	else{
+		out += h + ":00"
+	}
+	//log.debug out
+	return out
+}
+	
